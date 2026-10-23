@@ -1,15 +1,5 @@
 # WhatsApp plugin for BroCrew
 
-[![Latest release](https://img.shields.io/github/v/release/brocrew/brocrew-plugin-whatsapp)](https://github.com/brocrew/brocrew-plugin-whatsapp/releases/latest) [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE) ![Platforms: macOS and Windows](https://img.shields.io/badge/platform-macOS%20%C2%B7%20Windows-lightgrey)
+This repository is a clean source export of the WhatsApp plugin maintained and integration-tested with BroCrew. It contains no app history, no WhatsApp session and no messages. Its release workflow builds reproducible archives for macOS arm64 and Windows x64 with Go 1.27.2 and no cgo, runs the tests with a fake bridge and made-up chats, and emits the entry for BroCrew’s plugin list. Users install from Settings → Plugins and link a phone by scanning a QR code; they run no commands and supply no key or token.
 
-Let BroCrew's agents read your WhatsApp chats when you allow it, and send to the groups you choose.
-
-## Install
-
-In BroCrew, open **Settings → Plugins → Install** and choose **WhatsApp**. BroCrew downloads the plugin from [this repo's Releases](https://github.com/brocrew/brocrew-plugin-whatsapp/releases/latest) and checks its SHA-256 checksum. Then link your phone by scanning the QR code.
-
-**Privacy:** The plugin can access your linked account's chats; you control reading and which groups agents can send to with the switches in Settings.
-
-Includes code under the MIT licence: see [the upstream notice](plugins/whatsapp/bridge/UPSTREAM-LICENSE).
-
-[BroCrew](https://github.com/brocrew/brocrew) · [Building and testing](docs/DEVELOPMENT.md)
+BroCrew installs the archive for its own system; on Windows that needs an app whose plugin host runs plugins there. The plugin’s own notes are in `plugins/whatsapp/README.md`; the copied code’s MIT notice is in `plugins/whatsapp/bridge/UPSTREAM-LICENSE`.

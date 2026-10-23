@@ -22,6 +22,8 @@ it.skipIf(!folder)('publishes exactly the built archives and their fixed reposit
     expect(gunzipSync(bytes).equals(fs.readFileSync(path.join(folder!, name, 'whatsapp.tar')))).toBe(true)
     expect(target.url).toBe('https://github.com/brocrew/brocrew-plugin-whatsapp/releases/download/v' + entry.version + '/' + name + '.tar.gz')
     const manifest = JSON.parse(fs.readFileSync(path.join(folder!, name, 'package/plugin.json'), 'utf8'))
+    expect(manifest.sourceCommit).toBe(entry.sourceCommit)
+    expect(manifest.sourceCommit).toBe(process.env.BROCREW_PLUGIN_SOURCE_COMMIT)
     expect(manifest.platforms).toEqual([{ os: target.os, cpu: target.cpu }])
   }
 })
