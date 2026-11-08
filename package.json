@@ -1,0 +1,17 @@
+{
+  "name": "brocrew-plugin-whatsapp",
+  "version": "0.1.5",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "scripts": {
+    "build": "node scripts/build-plugin-release.mjs whatsapp",
+    "test": "vitest run --config vitest.release.config.mts",
+    "typecheck": "tsc --noEmit -p plugins/whatsapp/tsconfig.json"
+  },
+  "devDependencies": {
+    "vitest": "4.1.10",
+    "typescript": "5.9.3",
+    "@types/node": "22.19.15"
+  }
+}
