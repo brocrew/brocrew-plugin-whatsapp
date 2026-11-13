@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-const requestBodyLimit = 20000
+const requestBodyLimit = 128 * 1024 // Includes up to 1,024 selected group IDs.
 
 // decodeJSONBody reads exactly one bounded JSON object with only known fields; the result is a fixed code, or "".
 func decodeJSONBody(w http.ResponseWriter, r *http.Request, into any) string {
@@ -230,9 +230,7 @@ func newAPI(cfg config, s *session, unlinked func()) http.Handler {
 			writeCode(w, "not_connected")
 			return
 		}
-		lookup, cancelLookup := context.WithTimeout(r.Context(), 15*time.Second)
-		jid, ok := s.groupFor(lookup, request.Group)
-		cancelLookup()
+		jid, ok := groupJID(request.Group)
 		if !ok {
 			writeCode(w, "unknown_group")
 			return
@@ -268,11 +266,23 @@ func newAPI(cfg config, s *session, unlinked func()) http.Handler {
 		} else {
 			err = s.sendText(ctx, jid, request.Text)
 		}
-		if err != nil {
-			writeCode(w, "send_failed")
-			return
-		}
-		writeJSON(w, http.StatusOK, sendResult{Kind: att.Kind, Name: att.Name})
+		writeSendResult(w, att, err)
 	})
 	return mux
+}
+
+func writeSendResult(w http.ResponseWriter, att attachment, err error) {
+	if err != nil {
+		var caption *captionSendError
+		if errors.As(err, &caption) {
+			writeJSON(w, http.StatusBadGateway, map[string]any{
+				"error": "caption_failed", "audioSent": true, "captionSent": false,
+				"cause": caption.cause.Error(),
+			})
+			return
+		}
+		writeCode(w, "send_failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, sendResult{Kind: att.Kind, Name: att.Name})
 }

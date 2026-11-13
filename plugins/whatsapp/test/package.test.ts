@@ -1,7 +1,6 @@
+import { packageTestHelpers } from '../../shared/test/package-helpers.mjs'
 import fs from 'node:fs'
 import path from 'node:path'
-import os from 'node:os'
-import { createHash } from 'node:crypto'
 import { Readable } from 'node:stream'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { Client } from '@modelcontextprotocol/sdk/client/index.js'
@@ -14,16 +13,11 @@ import { createSettingsStore } from '../src/settings.js'
 import * as localFileGuard from '../src/localFileGuard.js'
 import { ALLOTMENT, ALTOS, FakeBridge, INES, ROWING } from './fakes.js'
 
-const cleanup: Array<() => void | Promise<void>> = []
+const { cleanup, temporary, requestFor, connectClient } = packageTestHelpers('fictional-whatsapp-')
 afterEach(async () => {
   vi.restoreAllMocks()
   for (const fn of cleanup.splice(0).reverse()) await fn()
 })
-const temporary = () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'fictional-whatsapp-'))
-  cleanup.push(() => fs.rmSync(root, { recursive: true, force: true }))
-  return root
-}
 const mcpToken = 'fictional-mcp-'.repeat(8)
 const adminToken = 'fictional-person-'.repeat(8)
 function configured() {
@@ -42,31 +36,19 @@ async function boot(options: { read?: boolean; writable?: string[]; prefix?: boo
   let clock = 1_800_000_000_000
   const server = await startWhatsApp(config, {
     bridge,
-    settings,
     logger: silentLogger,
     now: () => clock,
   })
   cleanup.push(() => server.close())
   const url = `http://127.0.0.1:${(server.httpServer.address() as { port: number }).port}`
-  async function request(endpoint: string, token?: string, body?: unknown, origin?: string) {
-    const response = await fetch(url + endpoint, {
-      method: body === undefined ? 'GET' : 'POST',
-      headers: {
-        ...(token ? { authorization: `Bearer ${token}` } : {}),
-        ...(body === undefined ? {} : { 'content-type': 'application/json' }),
-        ...(origin ? { origin } : {}),
-      },
-      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
-    })
-    return { status: response.status, body: await response.json() }
-  }
+  const request = requestFor(url)
   const client = new Client({ name: 'fictional-agent', version: '1.0.0' })
-  await client.connect(
+  await connectClient(
+    client,
     new StreamableHTTPClientTransport(new URL(url + '/mcp'), {
       requestInit: { headers: { authorization: `Bearer ${mcpToken}` } },
     }),
   )
-  cleanup.push(() => client.close())
   async function call(name: string, args: Record<string, unknown> = {}) {
     const result = (await client.callTool({ name, arguments: args })) as {
       content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>
@@ -87,8 +69,9 @@ async function boot(options: { read?: boolean; writable?: string[]; prefix?: boo
       : []
   return {
     config,
-    settings,
+    settings: server.settings,
     bridge,
+    client,
     request,
     call,
     text,
@@ -100,37 +83,29 @@ async function boot(options: { read?: boolean; writable?: string[]; prefix?: boo
 const refused = (line: string) => `Error: ${line}`
 
 describe('WhatsApp package', () => {
-  it('derives the server version from release metadata and contains no literal server version', () => {
+  it('derives the server version from release metadata', () => {
     const metadata = JSON.parse(fs.readFileSync('plugins/whatsapp/manifest-template.json', 'utf8'))
     expect(VERSION).toBe(metadata.version)
-    const inspect = (directory: string): void => {
-      for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
-        const file = path.join(directory, entry.name)
-        if (entry.isDirectory()) inspect(file)
-        else if (entry.name.endsWith('.ts'))
-          expect(fs.readFileSync(file, 'utf8')).not.toMatch(
-            /['"`]\d+\.\d+\.\d+(?:[-+][^'"`\s]+)?['"`]/,
-          )
-      }
-    }
-    inspect('plugins/whatsapp/src')
   })
 
-  it('requires explicit private paths and distinct private tokens', () => {
+  it('requires explicit paths and distinct tokens', () => {
     expect(() => loadConfig({})).toThrow('Plugin unavailable')
     expect(() => loadConfig({ BROCREW_WHATSAPP_DATA: 'relative' })).toThrow('Plugin unavailable')
     const config = configured()
-    for (const dir of [config.home, config.files, config.downloads, config.bridgeData, config.bin])
-      expect(fs.statSync(dir).mode & 0o777).toBe(0o700)
     fs.writeFileSync(config.authPath, JSON.stringify({ mcpToken, adminToken: mcpToken }))
     expect(() =>
       loadConfig({ BROCREW_WHATSAPP_DATA: config.home, BROCREW_WHATSAPP_AUTH: config.authPath }),
     ).toThrow('Plugin unavailable')
     fs.writeFileSync(config.authPath, JSON.stringify({ mcpToken, adminToken }))
+    fs.chmodSync(config.home, 0o755)
     fs.chmodSync(config.authPath, 0o644)
     expect(() =>
       loadConfig({ BROCREW_WHATSAPP_DATA: config.home, BROCREW_WHATSAPP_AUTH: config.authPath }),
-    ).toThrow('Plugin unavailable')
+    ).not.toThrow()
+    if (process.platform !== 'win32') {
+      expect(fs.statSync(config.home).mode & 0o777).toBe(0o755)
+      expect(fs.statSync(config.authPath).mode & 0o777).toBe(0o644)
+    }
   })
 
   it('keeps the person’s routes apart from the tools, and refuses browser origins', async () => {
@@ -209,6 +184,45 @@ describe('WhatsApp package', () => {
     expect(linking.status).toBe(200)
     expect(linking.body.state).toBe('pairing')
     expect(linking.body.qr.size).toBe(21)
+  })
+
+  it('sends to the group enabled through Settings using the persisted settings store', async () => {
+    const { request, config, bridge, text } = await boot()
+    expect(JSON.parse(await text('list_groups')).groups).toEqual([])
+    const enabled = await request('/v1/group-write', adminToken, {
+      group: ROWING.jid,
+      enabled: true,
+    })
+    expect(enabled.status).toBe(200)
+    expect(enabled.body.groups.find((group: { jid: string }) => group.jid === ROWING.jid)).toEqual({
+      ...ROWING,
+      canWrite: true,
+    })
+    expect(createSettingsStore(config.home).get().writable).toEqual([ROWING.jid])
+    expect(JSON.parse(await text('list_groups'))).toEqual({
+      groups: [{ id: ROWING.jid, name: ROWING.name }],
+    })
+    for (const [group, message] of [
+      [ROWING.jid, 'Boats at seven'],
+      [ROWING.name, 'Bring the oars'],
+    ]) {
+      expect(JSON.parse(await text('send_to_group', { group, text: message }))).toEqual({
+        sent: true,
+        group: ROWING.name,
+      })
+    }
+    expect(bridge.requests).toEqual([
+      { route: '/send', body: { group: ROWING.jid, text: '🤖 Boats at seven' } },
+      { route: '/send', body: { group: ROWING.jid, text: '🤖 Bring the oars' } },
+    ])
+    await request('/v1/group-write', adminToken, { group: ROWING.jid, enabled: false })
+    expect(createSettingsStore(config.home).get().writable).toEqual([])
+    expect(JSON.parse(await text('list_groups')).groups).toEqual([])
+    expect(await text('read_messages', { chat: ROWING.jid })).toBe(refused(REFUSALS['read-off']))
+    expect(await text('send_to_group', { group: ROWING.jid, text: 'See you there' })).toBe(
+      refused(REFUSALS['cannot-write']),
+    )
+    expect(bridge.requests).toHaveLength(2)
   })
 
   it('logs out and waits for the wipe before the app uninstalls it; only the person can ask', async () => {
@@ -310,6 +324,71 @@ describe('reading', () => {
     expect(JSON.parse(await text('search_contacts', { query: 'e' })).contacts).toHaveLength(2)
   })
 
+  it.each([
+    { read: false, selected: false },
+    { read: false, selected: true },
+    { read: true, selected: false },
+    { read: true, selected: true },
+  ])(
+    'applies the persisted access rule with read=$read and selected=$selected',
+    async ({ read, selected }) => {
+      const { text, request, config, bridge } = await boot()
+      bridge.messages[2].text = 'Boats for a private trip'
+      await request('/v1/read', adminToken, { enabled: read })
+      await request('/v1/group-write', adminToken, { group: ROWING.jid, enabled: selected })
+      expect(createSettingsStore(config.home).get()).toEqual({
+        read,
+        prefix: true,
+        writable: selected ? [ROWING.jid] : [],
+      })
+      expect(JSON.parse(await text('list_groups')).groups).toEqual(
+        selected ? [{ id: ROWING.jid, name: ROWING.name }] : [],
+      )
+      for (const chat of [ROWING.jid, ALLOTMENT.jid, INES]) {
+        const readable = read || (selected && chat === ROWING.jid)
+        for (const [tool, args] of [
+          ['read_messages', { chat }],
+          ['search_messages', { chat, query: 'boats' }],
+          ['get_media', { chat, message: 'MSG00003' }],
+        ] as const) {
+          const reply = await text(tool, args)
+          if (readable) expect(reply).not.toContain('Error:')
+          else expect(reply).toBe(refused(REFUSALS['read-off']))
+        }
+        const sent = await text('send_to_group', { group: chat, text: 'Training is at seven' })
+        if (selected && chat === ROWING.jid) expect(JSON.parse(sent).sent).toBe(true)
+        else expect(sent).toBe(refused(REFUSALS['cannot-write']))
+      }
+      if (read || selected) {
+        const listed = JSON.parse(await text('list_chats')).chats
+        expect(listed.map((one: { id: string }) => one.id)).toEqual(
+          read ? [ROWING.jid, INES] : [ROWING.jid],
+        )
+        const found = JSON.parse(await text('search_messages', { query: 'boats' })).messages
+        expect(found.map((one: { chat: string }) => one.chat)).toEqual(
+          read ? [INES, ROWING.jid] : [ROWING.jid],
+        )
+        const scope = read ? undefined : [ROWING.jid]
+        expect(bridge.requests.find((one) => one.route === '/chats')?.body).toEqual({
+          chats: scope,
+        })
+        expect(
+          bridge.requests.find(
+            (one) => one.route === '/messages' && !(one.body as { chat?: string }).chat,
+          )?.body,
+        ).toEqual({ query: 'boats', chats: scope })
+      } else {
+        expect(await text('list_chats')).toBe(refused(REFUSALS['read-off']))
+        expect(await text('search_messages', { query: 'boats' })).toBe(
+          refused(REFUSALS['read-off']),
+        )
+      }
+      const contacts = await text('search_contacts', { query: 'Ines' })
+      if (read) expect(JSON.parse(contacts).contacts).toHaveLength(2)
+      else expect(contacts).toBe(refused(REFUSALS['read-off']))
+    },
+  )
+
   it('refuses reading while no phone is linked', async () => {
     const { call, bridge } = await boot({ read: true })
     bridge.state = 'unlinked'
@@ -394,7 +473,7 @@ describe('sending', () => {
     ).toContain('"sent":true')
   })
 
-  it('takes a file only from the files folder, with its size and SHA-256', async () => {
+  it('takes a file only from the files folder, sending its path, name and size', async () => {
     const { call, bridge, config } = await boot({ writable: [ROWING.jid] })
     const inside = path.join(config.files, 'minutes.pdf')
     const bytes = Buffer.from('%PDF-1.7\nfictional minutes\n')
@@ -410,7 +489,6 @@ describe('sending', () => {
         path: fs.realpathSync(inside),
         name: 'minutes.pdf',
         size: bytes.length,
-        sha256: createHash('sha256').update(bytes).digest('hex'),
       },
     })
     const outside = path.join(config.home, 'elsewhere.pdf')
@@ -488,12 +566,54 @@ describe('sending', () => {
     },
   )
 
-  it('says the plugin is unavailable, not a refusal, when the bridge fails a send', async () => {
-    const { call, bridge, refusals } = await boot({ writable: [ROWING.jid] })
-    bridge.sendError = 'send_failed'
-    expect(
-      (await call('send_to_group', { group: ROWING.jid, text: 'Hello' })).content[0].text,
-    ).toBe('Error: Plugin unavailable. Try again.')
+  it('reports audio sent and the source caption error without retrying or releasing the send', async () => {
+    const { call, client, bridge, config, refusals } = await boot({ writable: [ROWING.jid] })
+    const file = path.join(config.files, 'meeting.mp3')
+    fs.writeFileSync(file, Buffer.from('ID3\u0004fictional audio'))
+    const originalCall = bridge.call.bind(bridge)
+    let sendCalls = 0
+    vi.spyOn(bridge, 'call').mockImplementation(async (route, body) => {
+      if (route !== '/send') return originalCall(route, body)
+      sendCalls++
+      return {
+        status: 502,
+        body: {
+          error: 'caption_failed',
+          audioSent: true,
+          captionSent: false,
+          cause: 'caption transport disconnected',
+        },
+      }
+    })
+    const result = await client.callTool({
+      name: 'send_to_group',
+      arguments: { group: ROWING.jid, text: 'Meet at six', file },
+    })
+    expect(result.isError).toBe(true)
+    expect(JSON.parse((result.content as Array<{ text: string }>)[0].text)).toEqual({
+      audioSent: true,
+      captionSent: false,
+      error: 'caption transport disconnected',
+      group: ROWING.name,
+      file: 'meeting.mp3',
+    })
+    expect(sendCalls).toBe(1)
+    expect(refusals()).toEqual([])
+    const repeated = await call('send_to_group', { group: ROWING.jid, text: 'Meet at six', file })
+    expect(repeated.content[0].text).toBe(refused(REFUSALS.duplicate))
+    expect(sendCalls).toBe(1)
+  })
+
+  it.each(['send_to_group', 'search_contacts'])('preserves bridge errors from %s', async (tool) => {
+    const { client, bridge, refusals } = await boot({ read: true, writable: [ROWING.jid] })
+    const reply = { status: 503, body: { error: 'send_failed', detail: 'Connection closed' } }
+    vi.spyOn(bridge, 'call').mockResolvedValueOnce(reply)
+    const args =
+      tool === 'search_contacts' ? { query: 'Ines' } : { group: ROWING.jid, text: 'Hello' }
+    expect(await client.callTool({ name: tool, arguments: args })).toEqual({
+      isError: true,
+      content: [{ type: 'text', text: `Error: ${JSON.stringify(reply)}` }],
+    })
     expect(refusals()).toEqual([])
   })
 

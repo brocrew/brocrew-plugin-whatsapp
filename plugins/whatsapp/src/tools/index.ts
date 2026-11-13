@@ -110,7 +110,6 @@ const SEND_REFUSALS: Readonly<Record<string, RefusalCode>> = Object.freeze({
   rate_limited: 'too-many',
   unsupported_media_type: 'file-type',
   outside: 'file',
-  changed: 'file',
   not_found: 'file',
 })
 const refusalIn = (map: Readonly<Record<string, RefusalCode>>, body: unknown) => {
@@ -129,7 +128,6 @@ export interface ToolDeps {
 export function createWhatsAppTools(deps: ToolDeps): ToolHandler[] {
   const { bridge, settings, refusals, config } = deps
 
-  /** One bridge request; its fixed refusals come back as the agent's words, anything else as unavailable. */
   async function ask(
     tool: string,
     route: string,
@@ -144,23 +142,28 @@ export function createWhatsAppTools(deps: ToolDeps): ToolHandler[] {
     if (reply.status === 200) return reply.body
     const { refusal } = refusalIn(known, reply.body)
     if (refusal) throw refusals.refuse(tool, refusal)
-    throw new Error('unavailable')
+    throw new Error(JSON.stringify(reply))
   }
 
-  /** Reading needs the person's yes and a linked phone; the stored messages stay readable while it reconnects. */
-  function mayRead(tool: string): void {
-    if (!settings.get().read) throw refusals.refuse(tool, 'read-off')
+  function access(tool: string, mode: 'read' | 'contacts' | 'write', chat?: string) {
+    const { read, writable } = settings.get()
+    if (
+      mode !== 'write' &&
+      !read &&
+      (mode === 'contacts' ||
+        (chat === undefined ? writable.length === 0 : !writable.includes(chat)))
+    )
+      throw refusals.refuse(tool, 'read-off')
     const state = bridge.status().state
     if (state === 'unlinked' || state === 'pairing') throw refusals.refuse(tool, 'not-linked')
-  }
-
-  function writableGroups(): BridgeGroup[] {
-    const writable = new Set(settings.get().writable)
-    return bridge.groups().filter((group) => writable.has(group.jid))
+    return {
+      groups: bridge.groups().filter((group) => writable.includes(group.jid)),
+      ...(read ? {} : { chats: writable }),
+    }
   }
 
   function groupNamed(tool: string, asked: string): BridgeGroup {
-    const groups = writableGroups()
+    const { groups } = access(tool, 'write')
     if (asked.endsWith('@g.us')) {
       const found = groups.find((group) => group.jid === asked)
       if (!found) throw refusals.refuse(tool, 'cannot-write')
@@ -211,8 +214,10 @@ export function createWhatsAppTools(deps: ToolDeps): ToolHandler[] {
           },
         },
         async run(a) {
-          mayRead('list_chats')
-          const body = (await ask('list_chats', '/chats', a, 15_000)) as { chats?: ChatRow[] }
+          const { chats } = access('list_chats', 'read')
+          const body = (await ask('list_chats', '/chats', { ...a, chats }, 15_000)) as {
+            chats?: ChatRow[]
+          }
           return json({
             chats: (body.chats ?? []).map((row) => ({
               id: row.jid,
@@ -246,7 +251,7 @@ export function createWhatsAppTools(deps: ToolDeps): ToolHandler[] {
           required: ['chat'],
         },
         async run(a) {
-          mayRead('read_messages')
+          access('read_messages', 'read', a.chat as string)
           const body = (await ask(
             'read_messages',
             '/messages',
@@ -280,8 +285,8 @@ export function createWhatsAppTools(deps: ToolDeps): ToolHandler[] {
           required: ['query'],
         },
         async run(a) {
-          mayRead('search_messages')
-          const body = (await ask('search_messages', '/messages', a, 15_000)) as {
+          const { chats } = access('search_messages', 'read', a.chat as string | undefined)
+          const body = (await ask('search_messages', '/messages', { ...a, chats }, 15_000)) as {
             messages?: MessageRow[]
           }
           return json({ messages: (body.messages ?? []).map(shownMessage) })
@@ -302,7 +307,7 @@ export function createWhatsAppTools(deps: ToolDeps): ToolHandler[] {
           required: ['query'],
         },
         async run(a) {
-          mayRead('search_contacts')
+          access('search_contacts', 'contacts')
           const body = (await ask('search_contacts', '/contacts', { query: a.query }, 15_000)) as {
             contacts?: Array<{ jid: string; name: string }>
           }
@@ -328,7 +333,7 @@ export function createWhatsAppTools(deps: ToolDeps): ToolHandler[] {
           required: ['chat', 'message'],
         },
         async run(a) {
-          mayRead('get_media')
+          access('get_media', 'read', a.chat as string)
           const out = path.join(
             config.downloads,
             `${randomBytes(8).toString('hex')}_${a.message as string}.jpg`,
@@ -372,11 +377,8 @@ export function createWhatsAppTools(deps: ToolDeps): ToolHandler[] {
           props: {},
         },
         async run() {
-          if (bridge.status().state === 'unlinked' || bridge.status().state === 'pairing')
-            throw refusals.refuse('list_groups', 'not-linked')
-          return json({
-            groups: writableGroups().map((group) => ({ id: group.jid, name: group.name })),
-          })
+          const { groups } = access('list_groups', 'write')
+          return json({ groups: groups.map((group) => ({ id: group.jid, name: group.name })) })
         },
       },
       {
@@ -410,8 +412,6 @@ export function createWhatsAppTools(deps: ToolDeps): ToolHandler[] {
           const file = a.file as string | undefined
           if (file === undefined && text.trim() === '')
             throw new PublicToolError('invalid arguments: "text" is required')
-          if (bridge.status().state === 'unlinked' || bridge.status().state === 'pairing')
-            throw refusals.refuse(tool, 'not-linked')
           const group = groupNamed(tool, a.group as string)
           if (
             characters(text) >
@@ -430,7 +430,13 @@ export function createWhatsAppTools(deps: ToolDeps): ToolHandler[] {
             : text
           const reply = await bridge.call(
             '/send',
-            { group: group.jid, text: sent, ...(attached ? { file: attached } : {}) },
+            {
+              group: group.jid,
+              text: sent,
+              ...(attached
+                ? { file: { path: attached.path, name: attached.name, size: attached.size } }
+                : {}),
+            },
             { signal: currentRequestSignal(), timeoutMs: attached ? 115_000 : 30_000 },
           )
           if (reply.status === 200)
@@ -440,10 +446,23 @@ export function createWhatsAppTools(deps: ToolDeps): ToolHandler[] {
               ...(attached ? { file: attached.name } : {}),
             })
           const { code, refusal } = refusalIn(SEND_REFUSALS, reply.body)
+          if (code === 'caption_failed') {
+            const partial = reply.body as { cause: string }
+            return {
+              isError: true,
+              ...json({
+                audioSent: true,
+                captionSent: false,
+                error: partial.cause,
+                group: group.name,
+                ...(attached ? { file: attached.name } : {}),
+              }),
+            }
+          }
           // A send that failed on the way may still have gone out, so it keeps counting.
           if (code !== 'send_failed') reservation.release()
           if (refusal) throw refusals.refuse(tool, refusal)
-          throw new Error('unavailable')
+          throw new Error(JSON.stringify(reply))
         },
       },
     ]

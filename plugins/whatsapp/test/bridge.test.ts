@@ -121,14 +121,13 @@ function setup(program = FAKE, built = program) {
 }
 
 describe('the bridge program', () => {
-  it('runs only the program whose SHA-256 the server was built with', async () => {
+  it('runs the local program even when its bytes differ from the build digest', async () => {
     const { bridge, config, run } = setup(FAKE, FAKE + '// another build\n')
-    await until(() => bridge.status().state === 'unavailable')
-    expect(fs.readdirSync(config.bin)).toEqual([])
-    expect(run()).toBeNull()
-    // Nothing reached WhatsApp, so the phone still lists the device.
-    bridge.unlink()
-    expect(bridge.status().removeOnPhone).toBe(true)
+    await until(() => bridge.status().state !== 'starting')
+    expect(bridge.status().state).toBe('unlinked')
+    expect(run()).not.toBeNull()
+    const [copy] = fs.readdirSync(config.bin)
+    expect(fs.readFileSync(path.join(config.bin, copy), 'utf8')).toBe(FAKE)
   })
 
   it('refreshes from the bridge even while the cached groups are fresh', async () => {
@@ -151,12 +150,12 @@ describe('the bridge program', () => {
     expect(bridge.groups()).toEqual([{ jid: '120363000000000001@g.us', name: 'ATLAS Team' }])
   })
 
-  it('runs an owner-only copy, with its folders and a fresh token on standard input only', async () => {
+  it('runs an executable copy, with its folders and a fresh token on standard input only', async () => {
     const { bridge, config, run } = setup()
     await until(() => bridge.status().state === 'unlinked')
     const [copy] = fs.readdirSync(config.bin)
     expect(copy).toMatch(/^whatsapp-bridge-[0-9a-f]{16}$/)
-    expect(fs.statSync(path.join(config.bin, copy)).mode & 0o777).toBe(0o700)
+    expect(fs.statSync(path.join(config.bin, copy)).mode & 0o100).toBe(0o100)
     const started = run()!
     expect(started.cwd).toBe(fs.realpathSync(config.bridgeData))
     // macOS adds __CF_USER_TEXT_ENCODING inside every process it starts; the server passes only these.

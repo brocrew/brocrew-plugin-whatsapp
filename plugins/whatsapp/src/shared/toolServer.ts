@@ -1,17 +1,10 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
-export class PublicToolError extends Error {}
-export interface ToolDefinition {
-  name: string
-  description: string
-  inputSchema: {
-    type: 'object'
-    properties: Record<string, unknown>
-    required?: string[]
-    additionalProperties?: boolean
-  }
-}
+import { dispatchTool, type ToolDefinition } from '../../../shared/tool-dispatch.js'
+export { PublicToolError } from '../../../shared/tool-dispatch.js'
+export type { ToolDefinition } from '../../../shared/tool-dispatch.js'
 export type ToolResult = {
+  isError?: boolean
   content: Array<{ type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string }>
 }
 export interface ToolHandler {
@@ -31,19 +24,7 @@ export function createToolServer(options: ToolServerOptions): Server {
   }))
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name: toolName, arguments: args } = request.params
-    const tool = tools.find((t) => t.definition.name === toolName)
-    if (!tool) {
-      return { content: [{ type: 'text', text: `Unknown tool: ${toolName}` }] }
-    }
-    try {
-      return await tool.execute((args as Record<string, unknown>) ?? {})
-    } catch (err: unknown) {
-      const msg =
-        err instanceof PublicToolError
-          ? err.message.slice(0, 2000)
-          : 'Plugin unavailable. Try again.'
-      return { content: [{ type: 'text', text: `Error: ${msg}` }] }
-    }
+    return dispatchTool(tools, toolName, args, (tool, parsed) => tool.execute(parsed))
   })
   return server
 }

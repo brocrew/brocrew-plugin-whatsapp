@@ -36,11 +36,18 @@ export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
     next()
   })
   const send = (res: Response, status: number, body: unknown): void => {
-    res.status(status).json(body)
+    const applied = res.locals.configuration && status >= 200 && status < 300
+    res.status(applied ? 200 : status).json(applied ? { applied: true } : body)
+  }
+  type AdminCommand = (body: unknown, res: Response) => void | Promise<void>
+  const commands = new Map<string, AdminCommand>()
+  const command = (action: string, path: string, handle: AdminCommand): void => {
+    commands.set(action, handle)
+    app.post('/v1' + path, (req, res) => handle(req.body, res))
   }
   const invalid = (res: Response): void => send(res, 400, { error: 'invalid' })
-  const bodyOf = (req: Request, allowed: readonly string[]): Record<string, unknown> | null => {
-    const b = req.body === undefined || req.body === null ? {} : req.body
+  const bodyOf = (input: unknown, allowed: readonly string[]): Record<string, unknown> | null => {
+    const b = input === undefined || input === null ? {} : input
     return isRecord(b) && Object.keys(b).every((k) => allowed.includes(k)) ? b : null
   }
   const view = (): AdminSettings => {
@@ -55,16 +62,17 @@ export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
     }
   }
   const switched = (
-    req: Request,
+    input: unknown,
     res: Response,
-    change: (body: Record<string, unknown>) => void,
+    change: (body: Record<string, unknown>) => void | false,
     allowed: readonly string[] = ['enabled'],
   ): void => {
-    const body = bodyOf(req, allowed)
+    const body = bodyOf(input, allowed)
     if (!body || typeof body.enabled !== 'boolean') return invalid(res)
     try {
-      change(body)
-    } catch {
+      if (change(body) === false) return invalid(res)
+    } catch (error) {
+      if (res.locals.configuration) throw error
       return invalid(res)
     }
     send(res, 200, view())
@@ -73,48 +81,93 @@ export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
   app.get('/healthz', (_req, res) => send(res, 200, { ok: true, version: deps.version }))
   app.get('/v1/status', (_req, res) => send(res, 200, bridge.status()))
   app.get('/v1/settings', (_req, res) => send(res, 200, view()))
-  app.post('/v1/refresh-groups', async (req, res) => {
-    if (!bodyOf(req, [])) return invalid(res)
+  app.get('/v1/configuration', (_req, res) =>
+    send(res, 200, { status: bridge.status(), ...view() }),
+  )
+  app.post('/v1/configuration', async (req, res) => {
+    const { payload, configRevision } = req.body ?? {}
+    if (!Number.isSafeInteger(configRevision) || configRevision < 0 || !isRecord(payload))
+      return invalid(res)
+    const { action, ...body } = payload
+    const handle = typeof action === 'string' ? commands.get(action) : undefined
+    if (!handle) return invalid(res)
+    res.locals.configuration = true
+    try {
+      await handle(body, res)
+    } catch (error) {
+      send(res, 500, { error: error instanceof Error ? error.message : String(error) })
+    }
+  })
+  command('refresh-groups', '/refresh-groups', async (body, res) => {
+    if (!bodyOf(body, [])) return invalid(res)
     try {
       await bridge.refreshGroups()
       send(res, 200, view())
-    } catch {
+    } catch (error) {
+      if (res.locals.configuration) throw error
       send(res, 503, { error: 'unavailable' })
     }
   })
-  app.post('/v1/link', async (req, res) => {
-    if (!bodyOf(req, [])) return invalid(res)
+  command('link-phone', '/link', async (body, res) => {
+    if (!bodyOf(body, [])) return invalid(res)
     if (!(await bridge.pair())) return send(res, 409, { error: 'state' })
     send(res, 200, bridge.status())
   })
-  app.post('/v1/unlink', (req, res) => {
-    if (!bodyOf(req, [])) return invalid(res)
-    void bridge.unlink()
+  command('unlink-phone', '/unlink', (body, res) => {
+    if (!bodyOf(body, [])) return invalid(res)
+    const work = bridge.unlink()
+    if (res.locals.configuration) return work.then(() => send(res, 200, {}))
     send(res, 202, {})
   })
-  // Before the app deletes the plugin: log out, phone side included, and wait until the data is gone.
-  app.post('/v1/uninstall', async (req, res) => {
-    if (!bodyOf(req, [])) return invalid(res)
+  const beforeRemove = async (req: Request, res: Response): Promise<void> => {
+    if (!bodyOf(req.body, [])) return invalid(res)
+    const before = bridge.status()
     let timer: NodeJS.Timeout | undefined
-    const done = await Promise.race([
-      bridge.unlink().then(() => true),
-      new Promise<boolean>((resolve) => {
-        timer = setTimeout(() => resolve(false), UNINSTALL_MS)
-      }),
-    ])
-    clearTimeout(timer)
-    if (done) send(res, 200, {})
-    else send(res, 504, { error: 'timeout' })
+    try {
+      const done = await Promise.race([
+        bridge.unlink().then(() => true),
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(false), UNINSTALL_MS)
+        }),
+      ])
+      if (!done) return send(res, 504, { error: 'timeout' })
+      const after = bridge.status()
+      const confirmed =
+        before.state === 'linked' &&
+        before.removeOnPhone === false &&
+        after.state === 'unlinked' &&
+        after.removeOnPhone === false
+      send(
+        res,
+        200,
+        req.path === '/v1/uninstall'
+          ? {}
+          : {
+              notice: confirmed
+                ? 'WhatsApp’s device was logged out.'
+                : 'Logout was not confirmed. Open Linked devices on your phone and remove this device if it is still listed.',
+            },
+      )
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+  app.post(['/v1/uninstall', '/v1/before-remove'], (req, res, next) => {
+    void beforeRemove(req, res).catch(next)
   })
-  app.post('/v1/read', (req, res) =>
-    switched(req, res, (body) => settings.setRead(body.enabled as boolean)),
+  command('set-read', '/read', (body, res) =>
+    switched(body, res, (body) => {
+      settings.setRead(body.enabled as boolean)
+    }),
   )
-  app.post('/v1/prefix', (req, res) =>
-    switched(req, res, (body) => settings.setPrefix(body.enabled as boolean)),
+  command('set-prefix', '/prefix', (body, res) =>
+    switched(body, res, (body) => {
+      settings.setPrefix(body.enabled as boolean)
+    }),
   )
-  app.post('/v1/group-write', (req, res) =>
+  command('set-group-write', '/group-write', (body, res) =>
     switched(
-      req,
+      body,
       res,
       (body) => {
         const group = body.group
@@ -123,7 +176,7 @@ export function registerAdminRoutes(app: Express, deps: AdminDeps): void {
           !GROUP_ID.test(group) ||
           (body.enabled === true && !bridge.groups().some((one) => one.jid === group))
         )
-          throw new Error('group')
+          return false
         settings.setWritable(group, body.enabled as boolean)
       },
       ['group', 'enabled'],

@@ -1,10 +1,7 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"io"
 	"os"
@@ -64,10 +61,9 @@ func (l *groupLimiter) reserve(now time.Time) bool {
 }
 
 type sendFile struct {
-	Path   string `json:"path"`
-	Name   string `json:"name"`
-	Size   int64  `json:"size"`
-	SHA256 string `json:"sha256"`
+	Path string `json:"path"`
+	Name string `json:"name"`
+	Size int64  `json:"size"`
 }
 
 type sendRequest struct {
@@ -87,26 +83,16 @@ type attachment struct {
 	Mime string
 	Kind string
 	Name string
-	SHA  []byte
 	Ext  string
 }
 
-// groupFor resolves a JID the Node server named to one of the account's own groups. A person is never a group.
-func (s *session) groupFor(ctx context.Context, raw string) (types.JID, bool) {
+// Node selects a writable group before calling /send; sending needs no second group-list request.
+func groupJID(raw string) (types.JID, bool) {
 	jid, err := types.ParseJID(raw)
 	if err != nil || jid.Server != types.GroupServer || jid.User == "" || jid.Device != 0 {
 		return types.EmptyJID, false
 	}
-	groups, err := s.groupsFor(ctx, false)
-	if err != nil {
-		return types.EmptyJID, false
-	}
-	for _, group := range groups {
-		if group.JID == jid.String() {
-			return jid, true
-		}
-	}
-	return types.EmptyJID, false
+	return jid, true
 }
 
 func validText(text string, limit int, needed bool) bool {
@@ -120,14 +106,9 @@ func within(root, real string) bool {
 	return err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel)
 }
 
-// openAttachment opens a file under the plugin's files folder without following links, then checks its size, its type from the
-// bytes and the SHA-256 the Node server computed. The file stays open; the caller closes it.
+// openAttachment checks the local file and its media type. The caller closes the open file.
 func openAttachment(filesDir string, request sendFile) (attachment, string) {
-	if request.Size <= 0 || request.Size > fileMaxBytes || len(request.SHA256) != 64 || len(request.Name) > 300 {
-		return attachment{}, "invalid_request"
-	}
-	wantSHA, err := hex.DecodeString(request.SHA256)
-	if err != nil {
+	if request.Size <= 0 || request.Size > fileMaxBytes || len(request.Name) > 300 {
 		return attachment{}, "invalid_request"
 	}
 	root, err := filepath.EvalSymlinks(filesDir)
@@ -160,24 +141,11 @@ func openAttachment(filesDir string, request sendFile) (attachment, string) {
 	if !ok {
 		return refuse("unsupported_media_type")
 	}
-	hasher := sha256.New()
-	if n, err := io.Copy(hasher, io.NewSectionReader(file, 0, request.Size)); err != nil || n != request.Size {
-		return refuse("invalid_request")
-	}
-	if !bytes.Equal(hasher.Sum(nil), wantSHA) {
-		return refuse("changed")
-	}
-	if typ.ScanTarGz {
-		names, err := tarGzNames(io.NewSectionReader(file, 0, request.Size))
-		if err != nil || anyEntryDenied(names) {
-			return refuse("unsupported_media_type")
-		}
-	}
 	return attachment{File: file, Size: request.Size, Mime: typ.Mime, Kind: typ.Kind, Name: displayName(request.Name, typ.Ext),
-		SHA: wantSHA, Ext: typ.Ext}, ""
+		Ext: typ.Ext}, ""
 }
 
-var errChangedFile = errors.New("the file changed while it was uploaded")
+var errUploadLength = errors.New("uploaded file length differs from the declared size")
 
 type mediaUploader interface {
 	UploadReader(ctx context.Context, plaintext io.Reader, tempFile io.ReadWriteSeeker, appInfo whatsmeow.MediaType) (whatsmeow.UploadResponse, error)
@@ -207,8 +175,7 @@ func mediaTypeFor(kind string) whatsmeow.MediaType {
 	return whatsmeow.MediaDocument
 }
 
-// uploadAttachment encrypts the file into a scratch file as it is read, and uploads from there; the hash the upload computed
-// must equal the one that was checked, so what is sent is what was checked.
+// uploadAttachment uploads through a temporary scratch file and retains the provider response.
 func uploadAttachment(ctx context.Context, up mediaUploader, att attachment, dir string) (whatsmeow.UploadResponse, error) {
 	scratch, err := os.CreateTemp(dir, "upload-*")
 	if err != nil {
@@ -222,8 +189,8 @@ func uploadAttachment(ctx context.Context, up mediaUploader, att attachment, dir
 	if err != nil {
 		return whatsmeow.UploadResponse{}, err
 	}
-	if !bytes.Equal(resp.FileSHA256, att.SHA) || resp.FileLength != uint64(att.Size) {
-		return whatsmeow.UploadResponse{}, errChangedFile
+	if resp.FileLength != uint64(att.Size) {
+		return whatsmeow.UploadResponse{}, errUploadLength
 	}
 	return resp, nil
 }
@@ -280,15 +247,31 @@ func (s *session) sendMedia(ctx context.Context, jid types.JID, att attachment, 
 	if err != nil {
 		return err
 	}
-	for i, message := range buildMediaMessages(att, caption, resp) {
+	return sendMediaMessages(buildMediaMessages(att, caption, resp), func(message *waE2E.Message) error {
 		sent, err := client.SendMessage(ctx, jid, message)
+		if err == nil {
+			s.recordOwnSend(client, jid, sent, message, att)
+		}
+		return err
+	})
+}
+
+type captionSendError struct {
+	cause error
+}
+
+func (e *captionSendError) Error() string { return "audio sent; caption failed: " + e.cause.Error() }
+func (e *captionSendError) Unwrap() error { return e.cause }
+
+func sendMediaMessages(messages []*waE2E.Message, send func(*waE2E.Message) error) error {
+	for i, message := range messages {
+		err := send(message)
 		if err != nil {
 			if i == 0 {
 				return err
 			}
-			return nil
+			return &captionSendError{cause: err}
 		}
-		s.recordOwnSend(client, jid, sent, message, att)
 	}
 	return nil
 }

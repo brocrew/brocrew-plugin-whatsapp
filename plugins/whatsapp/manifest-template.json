@@ -1,7 +1,7 @@
 {
   "format": 2,
   "id": "whatsapp",
-  "version": "0.1.4",
+  "version": "0.1.8",
   "sourceCommit": "0000000000000000000000000000000000000000",
   "platforms": [
     {
@@ -35,6 +35,18 @@
     "adminPath": "/v1"
   },
   "skills": [],
+  "removal": {
+    "data": "delete",
+    "beforeRemove": true,
+    "note": "If logout cannot be confirmed, open Linked devices on your phone and remove this device if it is still listed."
+  },
+  "action": {
+    "id": "restart",
+    "kind": "restart",
+    "label": "Restart WhatsApp",
+    "note": "Restarts the WhatsApp connection.",
+    "failureAction": "restart WhatsApp"
+  },
   "serviceTemplates": [],
   "ui": {
     "entry": "ui/index.html",
@@ -50,6 +62,18 @@
       {
         "path": "ui/style.css",
         "mime": "text/css"
+      },
+      {
+        "path": "ui/base.css",
+        "mime": "text/css"
+      },
+      {
+        "path": "ui/rpc.js",
+        "mime": "text/javascript"
+      },
+      {
+        "path": "ui/settings-load-state.js",
+        "mime": "text/javascript"
       }
     ],
     "methodSchemas": {
@@ -170,7 +194,7 @@
       },
       {
         "id": "read-help",
-        "text": "Agents can read your chats, messages and contacts."
+        "text": "Agents can read all your chats, messages and contacts."
       },
       {
         "id": "groups",
@@ -178,7 +202,7 @@
       },
       {
         "id": "groups-help",
-        "text": "Agents can send only to groups you turn on."
+        "text": "Agents can read and send in groups you turn on, even with Read conversations off."
       },
       {
         "id": "can-write",
@@ -211,7 +235,7 @@
     ]
   },
   "permissions": {
-    "description": "Links to your WhatsApp account as a linked device. Agents can read your chats only while Read conversations is on, and send only to the groups you turn on. The session and messages stay in the plugin's private storage.",
+    "description": "Links to your WhatsApp account as a linked device. Read conversations lets agents read all chats. Groups you turn on stay readable and writable even while Read conversations is off. Agents send only to those groups. The session and messages stay in the plugin's private storage.",
     "resources": [
       {
         "id": "whatsapp",
